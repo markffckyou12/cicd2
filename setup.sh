@@ -11,13 +11,15 @@ echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 echo_info "--- Initializing Validated CI Factory ---"
 echo "------------------------------------------------------------"
 
+CONFIG_FILE=".factory_config"
+
 # 1. GitHub Check
 read -p "Enter GitHub Username: " GIT_USER
 read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""
 echo_info "Verifying GitHub PAT..."
 GH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u "$GIT_USER:$GIT_TOKEN" https://api.github.com/user)
 if [ "$GH_STATUS" != "200" ]; then
-    echo_error "GitHub Authentication failed (Status: $GH_STATUS). Check your PAT permissions."
+    echo_error "GitHub Authentication failed (Status: $GH_STATUS)."
 fi
 echo_success "GitHub Verified."
 
@@ -27,16 +29,20 @@ read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""
 echo_info "Verifying Docker Hub Credentials..."
 DOCKER_CHECK=$(curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'${DOCKER_USER}'", "password": "'${DOCKER_PASS}'"}' https://hub.docker.com/v2/users/login/)
 if [[ $DOCKER_CHECK == *"detail"* ]]; then
-    echo_error "Docker Hub Authentication failed. Check your username/password."
+    echo_error "Docker Hub Authentication failed."
 fi
 echo_success "Docker Hub Verified."
 
 # 3. Environment Config
 read -p "Enter Namespace [default: tekton-tasks]: " NAMESPACE
 NAMESPACE=${NAMESPACE:-tekton-tasks}
-
 read -p "Enter Service Account name [default: build-bot]: " SA_NAME
 SA_NAME=${SA_NAME:-build-bot}
+
+# --- SAVE TO CONFIG FOR SCRIPT 2 ---
+echo "DOCKER_USER=$DOCKER_USER" > "$CONFIG_FILE"
+echo "NAMESPACE=$NAMESPACE" >> "$CONFIG_FILE"
+echo "SA_NAME=$SA_NAME" >> "$CONFIG_FILE"
 
 read -p "Install and Auto-Open Tekton UI? (y/n) [default: n]: " INSTALL_UI
 INSTALL_UI=${INSTALL_UI:-n}
@@ -96,7 +102,7 @@ echo_info "Generating organized manifests..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml > "$BASE_DIR/namespace.yaml"
 kubectl apply -f "$BASE_DIR/namespace.yaml"
 
-# 1. Infrastructure
+# 1. Infrastructure (PVC)
 cat <<EOF > "$INFRA_DIR/pvc.yaml"
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -119,8 +125,7 @@ metadata:
   name: cleanup-workspace
   namespace: $NAMESPACE
 spec:
-  workspaces:
-    - name: source
+  workspaces: [{name: source}]
   steps:
     - name: clean
       image: alpine
@@ -129,21 +134,41 @@ spec:
         rm -rf /workspace/source/*
 EOF
 
-# 3. Security
+# 3. Security (WITH FETCH-CERT UPDATE)
+echo_info "Fetching current Sealed Secrets certificate..."
+kubeseal --controller-name=sealed-secrets-controller --controller-namespace=kube-system --fetch-cert > public-cert.pem
+
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml > "$SEC_DIR/service-account.yaml"
-kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" --dry-run=client -o yaml | kubeseal --format=yaml > "$SEC_DIR/docker-hub-sealed.yaml"
-kubectl create secret generic git-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth --dry-run=client -o yaml | kubeseal --format=yaml > "$SEC_DIR/git-creds-sealed.yaml"
+
+kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" --dry-run=client -o yaml | \
+kubeseal --format=yaml --cert=public-cert.pem --namespace "$NAMESPACE" > "$SEC_DIR/docker-hub-sealed.yaml"
+
+kubectl create secret generic git-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth --dry-run=client -o yaml | \
+kubeseal --format=yaml --cert=public-cert.pem --namespace "$NAMESPACE" > "$SEC_DIR/git-creds-sealed.yaml"
+
+rm public-cert.pem
 
 # Apply everything
 kubectl apply -f "$INFRA_DIR/"
 kubectl apply -f "$SEC_DIR/"
 kubectl apply -f "$TASK_DIR/"
-tkn hub install task git-clone -n "$NAMESPACE"
-tkn hub install task buildah -n "$NAMESPACE"
+tkn hub install task git-clone -n "$NAMESPACE" 2>/dev/null
+tkn hub install task buildah -n "$NAMESPACE" 2>/dev/null
 
 # Patches
 kubectl patch task buildah -n "$NAMESPACE" --type='json' -p='[{"op": "add", "path": "/spec/steps/0/securityContext", "value": {"privileged": true}}]'
-sleep 5
+
+# --- SMART WAIT FOR DECRYPTION ---
+echo_info "Waiting for Secrets to decrypt..."
+for i in {1..12}; do
+    if kubectl get secret docker-hub-creds -n "$NAMESPACE" &>/dev/null; then
+        echo_success "Secrets ready."
+        break
+    fi
+    echo -n "."
+    sleep 5
+done
+
 kubectl annotate secret docker-hub-creds -n "$NAMESPACE" --overwrite tekton.dev/docker-0=https://index.docker.io/v1/
 kubectl annotate secret git-creds -n "$NAMESPACE" --overwrite tekton.dev/git-0=https://github.com
 kubectl label namespace "$NAMESPACE" pod-security.kubernetes.io/enforce=privileged --overwrite
@@ -151,27 +176,15 @@ kubectl create rolebinding "${SA_NAME}-edit" --clusterrole=edit --serviceaccount
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"git-creds\"}]}"
 
 # ==============================================================================
-# PHASE 5: CODESPACE-AWARE UI AUTO-LAUNCH
+# PHASE 5: UI AUTO-LAUNCH
 # ==============================================================================
 echo "------------------------------------------------------------"
 echo_success "BOOTSTRAP COMPLETE!"
 
 if [[ "$INSTALL_UI" =~ ^[Yy]$ ]]; then
-    # Bind to 0.0.0.0 to allow Codespace forwarding to catch it
     kubectl port-forward -n tekton-pipelines service/tekton-dashboard 9097:8080 --address 0.0.0.0 > /dev/null 2>&1 &
     UI_PID=$!
     sleep 3
-    
-    if [ "$CODESPACES" = "true" ]; then
-        echo_info "CODESPACE DETECTED: Opening Dashboard via Port Forwarding..."
-        echo_info "Check your 'Ports' tab in VS Code and open Port 9097."
-    else
-        URL="http://localhost:9097"
-        echo_success "Dashboard tunnel running (PID: $UI_PID)"
-        if command -v xdg-open > /dev/null; then xdg-open "$URL";
-        elif command -v open > /dev/null; then open "$URL";
-        elif command -v start > /dev/null; then start "$URL"; fi
-    fi
-    echo_info "To stop UI tunnel: kill $UI_PID"
+    echo_info "Dashboard Port 9097 (PID: $UI_PID)"
 fi
 echo "------------------------------------------------------------"

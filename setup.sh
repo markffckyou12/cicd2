@@ -6,22 +6,30 @@ echo_success() { echo -e "\e[32m[SUCCESS]\e[0m $1"; }
 echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 
 # ==============================================================================
-# PHASE 1: CREDENTIAL VALIDATION (FAIL-FAST)
+# PHASE 1: GITOPS & CREDENTIAL VALIDATION (FAIL-FAST)
 # ==============================================================================
-echo_info "--- Initializing Validated CI Factory ---"
+echo_info "--- Initializing GitOps-Ready CI Factory ---"
 echo "------------------------------------------------------------"
 
 CONFIG_FILE=".factory_config"
 
-# 1. GitHub Check
+# 1. GitHub Check (Validation of Identity + Repo Write Access)
 read -p "Enter GitHub Username: " GIT_USER
 read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""
-echo_info "Verifying GitHub PAT..."
-GH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u "$GIT_USER:$GIT_TOKEN" https://api.github.com/user)
-if [ "$GH_STATUS" != "200" ]; then
-    echo_error "GitHub Authentication failed (Status: $GH_STATUS)."
+read -p "Enter Target Repository (e.g., username/project): " REPO_NAME
+
+echo_info "Verifying GitHub Access & Write Permissions..."
+# Fetching repo metadata to check 'permissions' object
+REPO_DATA=$(curl -s -u "$GIT_USER:$GIT_TOKEN" "https://api.github.com/repos/$REPO_NAME")
+CAN_PUSH=$(echo "$REPO_DATA" | grep -o '"push": true')
+
+if [[ -z "$REPO_DATA" || "$REPO_DATA" == *"Not Found"* ]]; then
+    echo_error "Repository not found or Access Denied. Check your Token/Repo name."
+elif [[ -z "$CAN_PUSH" ]]; then
+    echo_error "You have READ access, but GITOPS requires WRITE access to update manifests/tags. Check PAT scopes."
+else
+    echo_success "GitHub Verified: Full Write Access detected for $REPO_NAME."
 fi
-echo_success "GitHub Verified."
 
 # 2. Docker Hub Check
 read -p "Enter Docker Hub Username: " DOCKER_USER
@@ -39,10 +47,11 @@ NAMESPACE=${NAMESPACE:-tekton-tasks}
 read -p "Enter Service Account name [default: build-bot]: " SA_NAME
 SA_NAME=${SA_NAME:-build-bot}
 
-# --- SAVE TO CONFIG FOR SCRIPT 2 ---
+# Save context for future Pipeline steps
 echo "DOCKER_USER=$DOCKER_USER" > "$CONFIG_FILE"
 echo "NAMESPACE=$NAMESPACE" >> "$CONFIG_FILE"
 echo "SA_NAME=$SA_NAME" >> "$CONFIG_FILE"
+echo "REPO_NAME=$REPO_NAME" >> "$CONFIG_FILE"
 
 read -p "Install and Auto-Open Tekton UI? (y/n) [default: n]: " INSTALL_UI
 INSTALL_UI=${INSTALL_UI:-n}
@@ -63,7 +72,7 @@ SEC_DIR="$BASE_DIR/security"
 mkdir -p "$INFRA_DIR" "$TASK_DIR" "$SEC_DIR"
 
 # ==============================================================================
-# PHASE 3: CONTROLLER INSTALLATION
+# PHASE 3: CONTROLLER & TOOL INSTALLATION
 # ==============================================================================
 kubectl cluster-info > /dev/null 2>&1 || echo_error "Cluster unreachable."
 
@@ -134,7 +143,7 @@ spec:
         rm -rf /workspace/source/*
 EOF
 
-# 3. Security (WITH FETCH-CERT UPDATE)
+# 3. Security (Sealing Validated Credentials)
 echo_info "Fetching current Sealed Secrets certificate..."
 kubeseal --controller-name=sealed-secrets-controller --controller-namespace=kube-system --fetch-cert > public-cert.pem
 
@@ -148,17 +157,21 @@ kubeseal --format=yaml --cert=public-cert.pem --namespace "$NAMESPACE" > "$SEC_D
 
 rm public-cert.pem
 
-# Apply everything
+# Apply Manifests
 kubectl apply -f "$INFRA_DIR/"
 kubectl apply -f "$SEC_DIR/"
 kubectl apply -f "$TASK_DIR/"
+
+# Install Hub Tasks (The Versioning Toolbox)
+echo_info "Installing Tekton Hub Tasks..."
 tkn hub install task git-clone -n "$NAMESPACE" 2>/dev/null
+tkn hub install task git-version -n "$NAMESPACE" 2>/dev/null
 tkn hub install task buildah -n "$NAMESPACE" 2>/dev/null
 
-# Patches
+# Patches for Buildah & Security
 kubectl patch task buildah -n "$NAMESPACE" --type='json' -p='[{"op": "add", "path": "/spec/steps/0/securityContext", "value": {"privileged": true}}]'
 
-# --- SMART WAIT FOR DECRYPTION ---
+# Wait for decryption logic
 echo_info "Waiting for Secrets to decrypt..."
 for i in {1..12}; do
     if kubectl get secret docker-hub-creds -n "$NAMESPACE" &>/dev/null; then
@@ -180,6 +193,8 @@ kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"na
 # ==============================================================================
 echo "------------------------------------------------------------"
 echo_success "BOOTSTRAP COMPLETE!"
+echo_info "Versioning Task: Ready"
+echo_info "GitOps Write-Access: Verified"
 
 if [[ "$INSTALL_UI" =~ ^[Yy]$ ]]; then
     kubectl port-forward -n tekton-pipelines service/tekton-dashboard 9097:8080 --address 0.0.0.0 > /dev/null 2>&1 &

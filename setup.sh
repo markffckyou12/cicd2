@@ -5,9 +5,10 @@ echo_info() { echo -e "\e[34m[INFO]\e[0m $1"; }
 echo_success() { echo -e "\e[32m[SUCCESS]\e[0m $1"; }
 echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 
-# Cleanup trap (Preserved from your original)
+# Cleanup trap 
 cleanup_temp() {
     rm -f buildah-raw.yaml d-plain.yaml d-sealed.yaml
+    echo_info "Temporary manifests cleaned."
 }
 trap cleanup_temp EXIT
 
@@ -25,7 +26,8 @@ echo_info "Checking Cluster Controllers..."
 kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/controller.yaml
 
-# Robust wait instead of sleep for Phase 5 stability
+# Robust wait for controllers to be ready
+echo_info "Waiting for Sealed Secrets Controller..."
 kubectl wait --for=condition=available --timeout=180s deployment/sealed-secrets-controller -n kube-system
 
 # ==============================================================================
@@ -43,18 +45,24 @@ echo "::add-mask::$GIT_TOKEN" 2>/dev/null || true
 
 echo_info "Verifying GitHub Access..."
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "$GIT_USER:$GIT_TOKEN" "https://api.github.com/repos/$REPO_NAME")
-[ "$HTTP_CODE" -ne 200 ] && echo_error "GitHub Access Denied (HTTP $HTTP_CODE)."
+
+if [ "$HTTP_CODE" -ne 200 ]; then
+    echo -e "\e[33m[WARNING]\e[0m GitHub API returned $HTTP_CODE. If this is a private repo, ensure your PAT has 'repo' scope."
+else
+    echo_success "GitHub Access Verified."
+fi
 
 DOCKER_USER=${DOCKER_USER:-$(read -p "Enter Docker Hub Username: " du && echo $du)}
 DOCKER_PASS=${DOCKER_PASS:-$(read -s -p "Enter Docker Hub Password: " dp && echo $dp)}
 echo "::add-mask::$DOCKER_PASS" 2>/dev/null || true
-echo_success "Identity Verified."
+echo_success "Identity logic configured."
 
 # ==============================================================================
 # PHASE 2: RESOURCE BUDGETING
 # ==============================================================================
 NAMESPACE=${NAMESPACE:-tekton-tasks}
 PVC_SIZE=10Gi
+# 1=Standard, 2=AWS gp3, 3=GCP Premium, 4=Azure Managed
 CLOUD_CHOICE=${CLOUD_CHOICE:-1}
 case $CLOUD_CHOICE in 2) SC="gp3" ;; 3) SC="premium-rwo" ;; 4) SC="managed-csi-premium" ;; *) SC="standard" ;; esac
 
@@ -62,7 +70,7 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 kubectl label --overwrite ns "$NAMESPACE" pod-security.kubernetes.io/enforce=baseline
 
 # ==============================================================================
-# PHASE 3: ENGINE & TOOL INSTALLATION
+# PHASE 3: ENGINE & TOOL INSTALLATION (Consolidated)
 # ==============================================================================
 echo_info "Installing Engines & CLIs..."
 [ ! -x "$(command -v tkn)" ] && { curl -LO https://github.com/tektoncd/cli/releases/download/v0.43.0/tkn_0.43.0_Linux_x86_64.tar.gz && sudo tar xvzf tkn_0.43.0_Linux_x86_64.tar.gz -C /usr/local/bin/ tkn && rm tkn_0.43.0_Linux_x86_64.tar.gz; }
@@ -86,7 +94,7 @@ for TASK in "${ALL_TASKS[@]}"; do
     tkn hub install task "$TASK" -n "$NAMESPACE" 2>/dev/null || echo_info "Task $TASK ready."
 done
 
-# PATCH: Buildah Rootless + Overlay Driver
+# PATCH: Buildah Rootless (Standardized for Hardened CI)
 tkn hub get task buildah --version 0.7 > buildah-raw.yaml
 yq -i '.spec.steps[0].securityContext = {"runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000, "allowPrivilegeEscalation": false}' buildah-raw.yaml
 yq -i '.spec.steps[0].env += [{"name": "STORAGE_DRIVER", "value": "overlay"}]' buildah-raw.yaml
@@ -111,7 +119,7 @@ spec:
   resources: { requests: { storage: $PVC_SIZE } }
 EOF
 
-# 2. ServiceAccount & Tekton Manager RBAC
+# 2. RBAC Setup
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
@@ -136,27 +144,31 @@ subjects: [{ kind: ServiceAccount, name: $SA_NAME, namespace: $NAMESPACE }]
 roleRef: { kind: Role, name: tekton-manager-role, apiGroup: rbac.authorization.k8s.io }
 EOF
 
-# 3. Supply Chain Signing Keys
+# 3. Supply Chain Signing Health Check
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" > /dev/null 2>&1; then
+    echo_info "Generating Supply Chain Signing Keys..."
     export COSIGN_PASSWORD=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32)
-    echo_success "GEN COSIGN PASS: $COSIGN_PASSWORD"
     cosign generate-key-pair k8s://"$NAMESPACE"/cosign-keys
+    
+    # HEALTH CHECK
+    if kubectl get secret cosign-keys -n "$NAMESPACE" > /dev/null 2>&1; then
+        echo_success "Cosign keys generated and stored in cluster."
+    else
+        echo_error "Failed to generate signing keys."
+    fi
 fi
 
-# 4. Private Git Auth (Required for private repo cloning)
+# 4. Secret Management
 kubectl create secret generic git-creds \
   --from-literal=username="$GIT_USER" \
   --from-literal=password="$GIT_TOKEN" \
   --type=kubernetes.io/basic-auth -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret git-creds "tekton.dev/git-0=https://github.com" -n "$NAMESPACE" --overwrite
 
-# 5. Sealed Docker Credentials
-echo_info "Sealing Credentials..."
 kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" --dry-run=client -o yaml > d-plain.yaml
 kubeseal --format=yaml --namespace "$NAMESPACE" < d-plain.yaml > d-sealed.yaml
 kubectl apply -f d-sealed.yaml
 
-# 6. Link Secrets to SA
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"git-creds\"}]}"
 
 # ==============================================================================
@@ -214,5 +226,4 @@ spec:
 EOF
 
 echo_success "V4.6 HARDENED BOOTSTRAP COMPLETE!"
-echo_info "Trigger command:"
-echo "tkn pipeline start universal-ci-pipeline --serviceaccount $SA_NAME -w name=shared-data,claimName=tekton-pvc -p repo-url=https://github.com/$REPO_NAME -p image-name=myapp -n $NAMESPACE"
+echo_info "Ready for Script 2 (The Smart Runner)."

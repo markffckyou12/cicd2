@@ -8,7 +8,7 @@ echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 # ==============================================================================
 # PHASE 1: IDENTITY & GITOPS VALIDATION
 # ==============================================================================
-echo_info "--- Initializing Secure CI Factory (2026 Hardened Edition v3.1) ---"
+echo_info "--- Initializing Secure CI Factory (2026 Hardened Edition v3.5) ---"
 
 # Fallback to interactive if env vars aren't set
 GIT_USER=${GIT_USER:-$(read -p "Enter GitHub Username: " u && echo $u)}
@@ -26,11 +26,11 @@ echo ""
 echo_success "Identity Verified."
 
 # ==============================================================================
-# PHASE 2: RESOURCE BUDGETING & QUOTAS
+# PHASE 2: RESOURCE BUDGETING & QUOTAS (Hardened for Parallelism)
 # ==============================================================================
 NAMESPACE=${NAMESPACE:-tekton-tasks}
-MAX_PODS=${MAX_PODS:-10}
-PVC_SIZE=${PVC_SIZE:-5Gi}
+MAX_PODS=${MAX_PODS:-20}  # Increased for Layer 1-5 parallel gates
+PVC_SIZE=${PVC_SIZE:-10Gi} # Increased for multi-layer scanning cache
 CLOUD_CHOICE=${CLOUD_CHOICE:-1}
 
 case $CLOUD_CHOICE in 2) SC="gp3" ;; 3) SC="premium-rwo" ;; 4) SC="managed-csi-premium" ;; *) SC="standard" ;; esac
@@ -60,35 +60,37 @@ echo_info "Waiting for Engines to initialize..."
 kubectl wait --for=condition=Available deployment/tekton-pipelines-controller -n tekton-pipelines --timeout=90s
 
 # ==============================================================================
-# PHASE 4: DYNAMIC TASK PROVISIONING (The Declarative Way)
+# PHASE 4: THE HARDENED TASK REGISTRY (Layers 1-5)
 # ==============================================================================
-echo_info "Provisioning Tasks in namespace: $NAMESPACE"
+echo_info "Provisioning Hardened Task Registry..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace "$NAMESPACE" pod-security.kubernetes.io/enforce=baseline --overwrite
 
-# Select Language Linter
+# Layer 1 Selection Logic
 LANG_CHOICE=${LANG_CHOICE:-1}
 case $LANG_CHOICE in
-    1) TASKS_L1=("flake8") ;;
+    1) TASKS_L1=("flake8" "pylint" "mypy-lint" "python-black") ;;
     2) TASKS_L1=("eslint") ;;
     3) TASKS_L1=("golangci-lint") ;;
     4) TASKS_L1=("ruby-linter") ;;
     5) TASKS_L1=("shellcheck") ;;
 esac
 
-TASKS_UNIVERSAL=("yaml-lint" "git-clone")
-ALL_TASKS=("${TASKS_L1[@]}" "${TASKS_UNIVERSAL[@]}")
+# Comprehensive Toolset
+TASKS_INFRA=("yaml-lint" "kube-linter" "datree")        # Layer 2
+TASKS_PACKAGE=("hadolint" "git-clone")                  # Layer 3
+TASKS_MAINTENANCE=("markdown-lint" "shellcheck")        # Layer 4
+TASKS_SPECIAL=("stackrox-image-check")                  # Layer 5 (Placeholder)
 
-# Install Universal Tasks
+ALL_TASKS=("${TASKS_L1[@]}" "${TASKS_INFRA[@]}" "${TASKS_PACKAGE[@]}" "${TASKS_MAINTENANCE[@]}" "${TASKS_SPECIAL[@]}")
+
+# Idempotent Task Installer
 for TASK in "${ALL_TASKS[@]}"; do
-    tkn hub install task "$TASK" -n "$NAMESPACE" 2>/dev/null || echo_info "Task $TASK exists."
+    tkn hub install task "$TASK" -n "$NAMESPACE" 2>/dev/null || echo_info "Task $TASK active."
 done
 
-# --- IMPROVED BUILDAH INSTALLATION ---
-# Instead of patching a live object, we transform the YAML using yq
-echo_info "Configuring Buildah with fuse-overlayfs (Declarative)..."
+# --- Buildah Configuration ---
 tkn hub get task buildah --version 0.7 > buildah-raw.yaml
-
 yq -i '
   .spec.steps[0].env += [{"name": "STORAGE_DRIVER", "value": "overlay"}] |
   .spec.steps[0].env += [{"name": "STORAGE_OPTS", "value": "mount_program=/usr/bin/fuse-overlayfs"}] |
@@ -99,17 +101,14 @@ yq -i '
     "capabilities": {"add": ["SYS_ADMIN"]}
   }
 ' buildah-raw.yaml
-
-kubectl apply -f buildah-raw.yaml -n "$NAMESPACE"
-rm buildah-raw.yaml
+kubectl apply -f buildah-raw.yaml -n "$NAMESPACE" && rm buildah-raw.yaml
 
 # ==============================================================================
-# PHASE 5: MANIFEST GENERATION & INFRASTRUCTURE
+# PHASE 5: INFRASTRUCTURE & SECURITY
 # ==============================================================================
 BASE_DIR="./tekton-bootstrap-v3"
 mkdir -p "$BASE_DIR/infrastructure" "$BASE_DIR/security"
 
-# Resource Quotas
 cat <<EOF > "$BASE_DIR/infrastructure/quota.yaml"
 apiVersion: v1
 kind: ResourceQuota
@@ -122,7 +121,6 @@ spec:
     requests.storage: $PVC_SIZE
 EOF
 
-# PVC
 cat <<EOF > "$BASE_DIR/infrastructure/pvc.yaml"
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -137,7 +135,7 @@ spec:
       storage: $PVC_SIZE
 EOF
 
-# Sealed Secrets
+# Sealed Secrets Implementation
 echo_info "Sealing Credentials..."
 kubeseal --controller-name=sealed-secrets-controller --controller-namespace=kube-system --fetch-cert > public-cert.pem
 
@@ -151,13 +149,13 @@ rm public-cert.pem
 kubectl apply -f "$BASE_DIR/infrastructure/"
 kubectl apply -f "$BASE_DIR/security/"
 
-# Service Account
+# Service Account with Secrets
 SA_NAME="build-bot"
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"git-creds\"}]}"
 
 # ==============================================================================
-# PHASE 6: AUTO-PRUNING
+# PHASE 6: AUTO-PRUNING (The "Factory Janitor")
 # ==============================================================================
 cat <<EOF > "$BASE_DIR/infrastructure/cleanup.yaml"
 apiVersion: batch/v1
@@ -181,7 +179,7 @@ EOF
 kubectl apply -f "$BASE_DIR/infrastructure/cleanup.yaml"
 
 echo "------------------------------------------------------------"
-echo_success "V3.1 DECLARATIVE BOOTSTRAP COMPLETE!"
-echo_info "Buildah: Modified via yq (Success)"
-echo_info "Namespace: $NAMESPACE"
+echo_success "V3.5 HARDENED BOOTSTRAP COMPLETE!"
+echo_info "Included: Layer 1 (App), Layer 2 (Infra), Layer 3 (Container)"
+echo_info "Namespace: $NAMESPACE | Pod Limit: $MAX_PODS"
 echo "------------------------------------------------------------"

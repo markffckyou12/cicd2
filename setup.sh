@@ -25,14 +25,24 @@ ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 [ ! -x "$(command -v kubeseal)" ] && { curl -L "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/kubeseal-0.24.0-${OS}-${ARCH}.tar.gz" | tar xz && sudo install -m 755 kubeseal /usr/local/bin/kubeseal && rm kubeseal; }
 [ ! -x "$(command -v yq)" ] && { curl -L "https://github.com/mikefarah/yq/releases/latest/download/yq_${OS}_${ARCH}" -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq; }
 
+# Install Tekton Pipelines & Dashboard
 kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+
+# Install Sealed Secrets
 kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/controller.yaml
+
+# Install Kyverno (Policy Engine)
+kubectl apply -f https://github.com/kyverno/kyverno/releases/download/v1.10.0/install.yaml
+
+echo_info "Waiting for controllers to stabilize..."
 kubectl wait --for=condition=available --timeout=180s deployment/sealed-secrets-controller -n kube-system
+kubectl wait --for=condition=available --timeout=180s deployment/kyverno -n kyverno
 
 # ==============================================================================
 # PHASE 1: IDENTITY
 # ==============================================================================
-echo_info "--- Hardened CI Factory v4.8 ---"
+echo_info "--- Hardened CI Factory v5.0 ---"
 GIT_USER=${GIT_USER:-$(read -p "GitHub Username: " u && echo $u)}
 GIT_TOKEN=${GIT_TOKEN:-$(read -s -p "GitHub PAT: " t && echo $t)}
 echo ""
@@ -53,7 +63,7 @@ case $LANG_CHOICE in
     golang)      SPECIFIC_LINTER="golangci-lint"; EXTRA_TASKS=() ;;
     java-maven)  SPECIFIC_LINTER="maven"; EXTRA_TASKS=() ;;
     java-gradle) SPECIFIC_LINTER="gradle"; EXTRA_TASKS=() ;;
-    cpp)         SPECIFIC_LINTER="cppcheck"; EXTRA_TASKS=() ;;
+    cpp)          SPECIFIC_LINTER="cppcheck"; EXTRA_TASKS=() ;;
     *)           SPECIFIC_LINTER="shellcheck"; EXTRA_TASKS=() ;;
 esac
 
@@ -73,7 +83,7 @@ yq -i '.spec.steps[0].env += [{"name": "STORAGE_DRIVER", "value": "overlay"}]' b
 kubectl apply -f buildah-raw.yaml -n "$NAMESPACE"
 
 # ==============================================================================
-# PHASE 3: RBAC, PVC, & SIGNING
+# PHASE 3: RBAC, PVC, SIGNING & PRUNING
 # ==============================================================================
 SA_NAME="build-bot"
 
@@ -107,6 +117,16 @@ metadata:
   namespace: $NAMESPACE
 subjects: [{ kind: ServiceAccount, name: $SA_NAME, namespace: $NAMESPACE }]
 roleRef: { kind: Role, name: tekton-manager-role, apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: tekton.dev/v1alpha1
+kind: PruningReplicated
+metadata:
+  name: keep-last-10-runs
+  namespace: $NAMESPACE
+spec:
+  resources:
+    - pipelineRuns
+  keep: 10
 EOF
 
 # Cosign key generation
@@ -184,4 +204,35 @@ spec:
       workspaces: [{ name: source, workspace: shared-data }]
 EOF
 
-echo_success "V4.8 BOOTSTRAP COMPLETE! Suite: $LANG_CHOICE"
+# ==============================================================================
+# PHASE 5: ADMISSION CONTROL POLICY (KYVERNO)
+# ==============================================================================
+echo_info "Enforcing Image Integrity Policy..."
+PUBLIC_KEY=$(kubectl get secret cosign-keys -n "$NAMESPACE" -o jsonpath='{.data.cosign\.pub}' | base64 -d)
+
+cat <<EOF | kubectl apply -f -
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-signed-images
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: check-image-signature
+      match:
+        any:
+        - resources:
+            kinds: ["Pod"]
+            namespaces: ["$NAMESPACE"]
+      verifyImages:
+        - imageReferences: ["docker.io/$DOCKER_USER/*"]
+          attestors:
+            - entries:
+              - keys:
+                  publicKeys: |
+$(echo "$PUBLIC_KEY" | sed 's/^/                    /')
+EOF
+
+echo_success "V5.0 BOOTSTRAP COMPLETE! Suite: $LANG_CHOICE"
+echo_info "Dashboard: kubectl port-forward -n tekton-pipelines service/tekton-dashboard 9097:9097"

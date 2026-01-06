@@ -1,47 +1,29 @@
 #!/bin/bash
 set -euo pipefail 
 
-# --- Helper Functions ---
-echo_info() { echo -e "\e[34m[INFO]\e[0m $1"; }
-echo_success() { echo -e "\e[32m[SUCCESS]\e[0m $1"; }
-echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.8.3 ---"
 
-# ==============================================================================
-# PHASE 1: IDENTITY
-# ==============================================================================
-echo_info "--- DevSecOps Factory v6.3.1 (Preparation Mode) ---"
-
+# --- 1. IDENTITY ---
 GIT_USER="markffckyou12"
 REPO_NAME="markffckyou12/cicd2"
 DOCKER_USER="ffckyou123"
-GIT_TOKEN=${GIT_TOKEN:-$(read -s -p "Enter GitHub PAT: " t && echo "$t")}
-echo ""
-DOCKER_PASS=${DOCKER_PASS:-$(read -s -p "Enter Docker Hub Password: " dp && echo "$dp")}
-echo ""
-
 NAMESPACE="tekton-tasks"
 IMAGE_NAME="docker.io/$DOCKER_USER/cicd-test:latest"
-TRIVY_SERVER_DEFAULT="http://host.minikube.internal:8080"
+TRIVY_SERVER_URL="http://host.minikube.internal:8080"
 COSIGN_PASSWORD="factory-password-123"
+SA_NAME="build-bot"
 
-# ==============================================================================
-# PHASE 2: INFRASTRUCTURE
-# ==============================================================================
-echo_info "Creating Namespace & Deploying Tools..."
+if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
+if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
+
+# --- 2. CLEANUP & NAMESPACE ---
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f https://github.com/kyverno/kyverno/releases/download/v1.10.0/install.yaml --server-side
-kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 
-echo_info "Waiting for Controllers..."
-kubectl wait --for=condition=Available deployment/tekton-pipelines-controller -n tekton-pipelines --timeout=120s
-kubectl wait --for=condition=Available deployment/kyverno-admission-controller -n kyverno --timeout=120s
+# --- 3. KYVERNO GLOBAL EXCLUSIONS ---
+# This allows the "cosign-gen" and Tekton pods to run without being blocked by the signing policy
+kubectl patch configmap kyverno -n kyverno --type merge -p "{\"data\":{\"resourceFilters\":\"[Event,*,*][Node,*,*][APIService,*,*][TokenReview,*,*][SubjectAccessReview,*,*][SelfSubjectAccessReview,*,*][*,kyverno,*][Binding,*,*][ReplicaSet,*,*][AdmissionReport,*,*][ClusterAdmissionReport,*,*][BackgroundScanReport,*,*][ClusterBackgroundScanReport,*,*][*,tekton-tasks,cosign-gen*][*,tekton-tasks,affinity-assistant-*]\"}}"
 
-# ==============================================================================
-# PHASE 3: SECURITY & AUTH
-# ==============================================================================
-echo_info "Handling Cosign Keys and RBAC..."
-
-# 1. Create the secret if it doesn't exist
+# --- 4. KEY GENERATION ---
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" >/dev/null 2>&1; then
     kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never --image=gcr.io/projectsigstore/cosign:v2.2.1 --env="COSIGN_PASSWORD=$COSIGN_PASSWORD" -- generate-key-pair k8s://"$NAMESPACE"/cosign-keys
@@ -50,26 +32,55 @@ fi
 
 PUBLIC_KEY=$(kubectl get secret cosign-keys -n "$NAMESPACE" -o jsonpath='{.data.cosign\.pub}' | base64 -d)
 
-# 2. Setup ServiceAccount and RBAC
-SA_NAME="build-bot"
+# --- 5. FIXED RBAC & AUTH ---
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# RBAC FIX: Explicitly allow build-bot to READ the secret for signing
-kubectl create role secret-reader --verb=get,list --resource=secrets -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-kubectl create rolebinding build-bot-secret-read --role=secret-reader --serviceaccount="$NAMESPACE:$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+# FIX: Giving the build-bot explicit GET/LIST access to the cosign secret
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cosign-secret-reader
+  namespace: $NAMESPACE
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["cosign-keys"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-bot-read-cosign
+  namespace: $NAMESPACE
+subjects:
+- kind: ServiceAccount
+  name: $SA_NAME
+  namespace: $NAMESPACE
+roleRef:
+  kind: Role
+  name: cosign-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+EOF
 
-# 3. Credentials
+# Credentials
 kubectl create secret generic github-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret github-creds "tekton.dev/git-0=https://github.com" --overwrite -n "$NAMESPACE"
-
 kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
-
-# Link secrets to SA
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-# 4. PVC
+# Networking & PVC
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: trivy-service
+spec:
+  type: ExternalName
+  externalName: host.minikube.internal
+  ports: [{port: 8080}]
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -79,7 +90,7 @@ spec:
   resources: { requests: { storage: 2Gi } }
 EOF
 
-# 5. Kyverno Policy
+# --- 6. ZERO-TRUST POLICY ---
 cat <<EOF | kubectl apply -f -
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -89,14 +100,14 @@ spec:
   validationFailureAction: Enforce
   background: false
   rules:
-    - name: verify-signature
+    - name: verify-all-images
       match:
         any:
         - resources:
             kinds: ["Pod"]
-            namespaces: ["$NAMESPACE", "default"]
+            namespaces: ["default"]
       verifyImages:
-        - imageReferences: ["docker.io/$DOCKER_USER/*"]
+        - imageReferences: ["*"]
           attestors:
             - entries:
               - keys:
@@ -104,11 +115,7 @@ spec:
 $(echo "$PUBLIC_KEY" | sed 's/^/                    /')
 EOF
 
-# ==============================================================================
-# PHASE 4: THE PIPELINE
-# ==============================================================================
-echo_info "Defining Pipeline..."
-
+# --- 7. RESTORED PIPELINE (WITH SOURCE SCAN) ---
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -121,7 +128,7 @@ spec:
     - name: image-full-name
       default: "$IMAGE_NAME"
     - name: trivy-server-url
-      default: "$TRIVY_SERVER_DEFAULT"
+      default: "$TRIVY_SERVER_URL"
   workspaces:
     - name: shared-data
   tasks:
@@ -169,44 +176,23 @@ spec:
           - name: cosign-sign
             image: gcr.io/projectsigstore/cosign:v2.2.1
             command: ["cosign"]
-            args:
-              - "sign"
-              - "--key"
-              - "k8s://$NAMESPACE/cosign-keys"
-              - "--yes"
-              - "\$(params.image-full-name)"
+            args: ["sign", "--key", "k8s://$NAMESPACE/cosign-keys", "--tlog-upload=false", "--yes", "\$(params.image-full-name)"]
             env: 
               - name: COSIGN_PASSWORD
                 value: "$COSIGN_PASSWORD"
               - name: REGISTRY_AUTH_FILE
                 value: /tekton/creds/.docker/config.json
 
-    - name: image-scan
+    - name: security-gate
       runAfter: ["sign-image"]
-      params: [{ name: image-full-name, value: "\$(params.image-full-name)" }, { name: trivy-server-url, value: "\$(params.trivy-server-url)" }]
+      params: [{ name: image-full-name, value: "\$(params.image-full-name)" }]
       taskSpec:
-        params: [{name: image-full-name, type: string}, {name: trivy-server-url, type: string}]
+        params: [{name: image-full-name, type: string}]
         steps:
           - name: trivy-image-scan
             image: aquasec/trivy:latest
             script: |
-              trivy image --server \$(params.trivy-server-url) --severity HIGH,CRITICAL \$(params.image-full-name)
+              trivy image --server http://trivy-service.$NAMESPACE.svc.cluster.local:8080 --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo_success "SETUP COMPLETE - V6.3.1 Ready."
-
-# ==============================================================================
-# PHASE 5: TEST COMMAND ECHO
-# ==============================================================================
-echo "-----------------------------------------------------------------------"
-echo_info "To test your pipeline, run the following command:"
-echo ""
-echo "tkn pipeline start devsecops-pipeline \\"
-echo "  --workspace name=shared-data,claimName=shared-ci-pvc \\"
-echo "  --serviceaccount $SA_NAME \\"
-echo "  --param repo-url=\"https://github.com/$REPO_NAME.git\" \\"
-echo "  --param image-full-name=\"$IMAGE_NAME\" \\"
-echo "  --param trivy-server-url=\"$TRIVY_SERVER_DEFAULT\" \\"
-echo "  -n $NAMESPACE \\"
-echo "  --showlog"
-echo "-----------------------------------------------------------------------"c
+echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.8.3 Ready."

@@ -9,7 +9,7 @@ echo_error() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 # ==============================================================================
 # PHASE 1: IDENTITY & ENVIRONMENT
 # ==============================================================================
-echo_info "--- Operational DevSecOps Factory v5.2.0 ---"
+echo_info "--- DevSecOps Factory v5.7.0 (Corrected Parameter Wiring) ---"
 
 GIT_USER=${GIT_USER:-"markffckyou12"}
 GIT_TOKEN=${GIT_TOKEN:-$(read -s -p "Enter GitHub PAT: " t && echo "$t")}
@@ -19,31 +19,28 @@ DOCKER_USER=${DOCKER_USER:-"ffckyou123"}
 DOCKER_PASS=${DOCKER_PASS:-$(read -s -p "Enter Docker Hub Password: " dp && echo "$dp")}
 echo ""
 NAMESPACE=${NAMESPACE:-"tekton-tasks"}
+IMAGE_NAME="docker.io/$DOCKER_USER/cicd-test:latest"
+
+# The "Bridge" address for Minikube to talk to your Codespace/Local Land
+TRIVY_SERVER_DEFAULT="http://host.minikube.internal:8080"
 
 # ==============================================================================
-# PHASE 2: NAMESPACE & INFRASTRUCTURE
+# PHASE 2: INFRASTRUCTURE & STABILITY
 # ==============================================================================
 echo_info "Creating Namespace: $NAMESPACE"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-kubectl label --overwrite ns "$NAMESPACE" pod-security.kubernetes.io/enforce=baseline
 
 echo_info "Deploying Tekton Core..."
 kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 
-echo_info "Waiting for Tekton stability..."
-kubectl wait --for=condition=Available deployment/tekton-pipelines-controller -n tekton-pipelines --timeout=120s
-kubectl wait --for=condition=Available deployment/tekton-pipelines-webhook -n tekton-pipelines --timeout=120s
-# Stability sleep to prevent Webhook "connection refused" errors
-sleep 10
+echo_info "Applying Stability Patch (Disabling Affinity Assistant)..."
+kubectl patch cm feature-flags -n tekton-pipelines -p '{"data":{"disable-affinity-assistant":"true"}}'
 
-# Create Pod Template File for PipelinRun execution
-echo_info "Creating pod-template.yaml..."
-cat <<EOF > pod-template.yaml
-securityContext:
-  fsGroup: 1000
-  runAsUser: 1000
-  runAsGroup: 1000
-EOF
+echo_info "Waiting for Tekton Controllers..."
+kubectl wait --for=condition=Available deployment/tekton-pipelines-controller -n tekton-pipelines --timeout=120s
+
+echo_info "Waiting for Tekton Webhook (to prevent Connection Refused)..."
+kubectl wait --for=condition=Available deployment/tekton-pipelines-webhook -n tekton-pipelines --timeout=120s
 
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
@@ -55,7 +52,6 @@ spec:
   resources: { requests: { storage: 2Gi } }
 EOF
 
-# Docker Secret & RBAC
 kubectl create secret docker-registry docker-hub-creds \
   --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" \
   --docker-server="https://index.docker.io/v1/" \
@@ -67,9 +63,9 @@ kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yam
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}]}"
 
 # ==============================================================================
-# PHASE 3: THE OPERATIONAL PIPELINE
+# PHASE 3: UPDATED PIPELINE (FIXED PARAMETER PASSING)
 # ==============================================================================
-echo_info "Defining Operational Security Pipeline..."
+echo_info "Defining Pipeline with Corrected Wiring..."
 
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
@@ -82,6 +78,9 @@ spec:
       type: string
     - name: image-full-name
       type: string
+    - name: trivy-server-url
+      type: string
+      default: "$TRIVY_SERVER_DEFAULT"
   workspaces:
     - name: shared-data
   tasks:
@@ -103,24 +102,32 @@ spec:
     - name: source-scan
       runAfter: ["fetch-repo"]
       workspaces: [ { name: source, workspace: shared-data } ]
+      params:
+        - name: trivy-server-url
+          value: \$(params.trivy-server-url)
       taskSpec:
+        params:
+          - name: trivy-server-url
+            type: string
         workspaces: [ { name: source } ]
         steps:
           - name: trivy-fs-scan
             image: aquasec/trivy:latest
             workingDir: \$(workspaces.source.path)
-            env:
-              - name: TRIVY_CACHE_DIR
-                value: \$(workspaces.source.path)/.trivycache
             script: |
-              mkdir -p \$TRIVY_CACHE_DIR
-              echo "GATE 1: Scanning Filesystem (Shift Left)..."
-              trivy fs --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --no-progress .
+              echo "Scanning source via \$(params.trivy-server-url)..."
+              trivy fs --server \$(params.trivy-server-url) --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed .
 
     - name: build-and-push
       runAfter: ["source-scan"]
       workspaces: [ { name: source, workspace: shared-data } ]
+      params:
+        - name: image-full-name
+          value: \$(params.image-full-name)
       taskSpec:
+        params:
+          - name: image-full-name
+            type: string
         workspaces: [ { name: source } ]
         steps:
           - name: buildah-push
@@ -130,38 +137,44 @@ spec:
               - name: REGISTRY_AUTH_FILE
                 value: /tekton/creds/.docker/config.json
             script: |
-              echo "Building \$(params.image-full-name)..."
               buildah bud --storage-driver=vfs -f ./Dockerfile -t \$(params.image-full-name) .
-              echo "Pushing..."
               buildah push --storage-driver=vfs \$(params.image-full-name)
 
     - name: image-scan
       runAfter: ["build-and-push"]
-      workspaces: [ { name: source, workspace: shared-data } ]
+      params:
+        - name: image-full-name
+          value: \$(params.image-full-name)
+        - name: trivy-server-url
+          value: \$(params.trivy-server-url)
       taskSpec:
-        workspaces: [ { name: source } ]
+        params:
+          - name: image-full-name
+            type: string
+          - name: trivy-server-url
+            type: string
         steps:
           - name: trivy-image-scan
             image: aquasec/trivy:latest
-            env:
-              - name: TRIVY_CACHE_DIR
-                value: \$(workspaces.source.path)/.trivycache
             script: |
-              echo "GATE 2: Scanning Final Image (Operational Gate)..."
-              trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \$(params.image-full-name)
+              echo "Scanning image via \$(params.trivy-server-url)..."
+              trivy image --server \$(params.trivy-server-url) --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \$(params.image-full-name)
 EOF
 
+echo_success "SETUP COMPLETE - PIPELINE IS NOW PARAMETERIZED AND WIRED"
+
 # ==============================================================================
-# FINISH
+# NEXT STEPS
 # ==============================================================================
-echo "------------------------------------------------------------"
-echo_success "OPERATIONAL DEVSECOPS BOOTSTRAP COMPLETE!"
-echo_info "To start your SECURE build, run:"
-echo "tkn pipeline start devsecops-pipeline \\
-  --param repo-url=https://github.com/$REPO_NAME.git \\
-  --param image-full-name=docker.io/$DOCKER_USER/cicd-test:latest \\
-  --workspace name=shared-data,claimName=shared-ci-pvc \\
-  --pod-template pod-template.yaml \\
-  --serviceaccount $SA_NAME \\
-  --namespace $NAMESPACE \\
-  --showlog"
+echo ""
+echo "To manually start the build (using the default local bridge):"
+echo "--------------------------------------------------------"
+echo "tkn pipeline start devsecops-pipeline \\"
+echo "  --param repo-url=\"https://github.com/$REPO_NAME.git\" \\"
+echo "  --param image-full-name=\"$IMAGE_NAME\" \\"
+echo "  --param trivy-server-url=\"$TRIVY_SERVER_DEFAULT\" \\"
+echo "  --workspace name=shared-data,claimName=shared-ci-pvc \\"
+echo "  --serviceaccount \"$SA_NAME\" \\"
+echo "  --namespace \"$NAMESPACE\" \\"
+echo "  --showlog"
+echo "--------------------------------------------------------"

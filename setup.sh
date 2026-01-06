@@ -9,9 +9,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.9.1 (Global Zero-Trust) ---"
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.9.3 (Native Janitor Edition) ---"
 
-# --- 1. IDENTITY ---
+# --- 1. IDENTITY & CONFIGURATION ---
 GIT_USER="markffckyou12"
 REPO_NAME="markffckyou12/cicd2"
 DOCKER_USER="ffckyou123"
@@ -21,13 +21,14 @@ TRIVY_SERVER_URL="http://host.minikube.internal:8080"
 COSIGN_PASSWORD="factory-password-123"
 SA_NAME="build-bot"
 
+# --- 2. CREDENTIAL CHECK ---
 if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
 if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
 
-# --- 2. NAMESPACE SETUP ---
+# --- 3. NAMESPACE & KYVERNO INFRA EXCLUSIONS ---
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# --- 3. KYVERNO INFRA EXCLUSIONS ---
+# Patching Kyverno config to ensure it doesn't interfere with internal Tekton/Cosign pods
 kubectl patch configmap kyverno -n kyverno --type merge -p "{\"data\":{\"resourceFilters\":\"[Event,*,*][Node,*,*][APIService,*,*][TokenReview,*,*][SubjectAccessReview,*,*][SelfSubjectAccessReview,*,*][*,kyverno,*][Binding,*,*][ReplicaSet,*,*][AdmissionReport,*,*][ClusterAdmissionReport,*,*][BackgroundScanReport,*,*][ClusterBackgroundScanReport,*,*][*,tekton-tasks,cosign-gen*][*,tekton-tasks,affinity-assistant-*]\"}}"
 
 # --- 4. SECURE KEY GENERATION ---
@@ -79,7 +80,7 @@ kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKE
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-# PVC for Pipeline
+# PVC for Pipeline Workspace
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -90,8 +91,8 @@ spec:
   resources: { requests: { storage: 2Gi } }
 EOF
 
-# --- 6. THE GLOBAL BOUNCER (Updated Policy) ---
-echo -e "\e[34m[INFO]\e[0m Deploying Global ClusterPolicy (Excluding Infra)..."
+# --- 6. THE GLOBAL BOUNCER (ClusterPolicy) ---
+echo -e "\e[34m[INFO]\e[0m Deploying Global ClusterPolicy..."
 cat <<EOF | kubectl apply -f -
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -109,7 +110,7 @@ spec:
       exclude:
         any:
         - resources:
-            namespaces: ["kube-system", "kyverno", "tekton-tasks", "tekton-pipelines"]
+            namespaces: ["kube-system", "kyverno", "$NAMESPACE", "tekton-pipelines"]
       verifyImages:
         - imageReferences: ["*"]
           attestors:
@@ -119,7 +120,7 @@ spec:
 $(echo "$PUBLIC_KEY" | sed 's/^/                    /')
 EOF
 
-# --- 7. THE PIPELINE ---
+# --- 7. THE PIPELINE (With Integrated Janitor) ---
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -193,6 +194,24 @@ spec:
             image: aquasec/trivy:latest
             script: |
               trivy image --server http://host.minikube.internal:8080 --severity CRITICAL --exit-code 1 \$(params.image-full-name)
+  
+  # --- THE NATIVE JANITOR ---
+  # This 'finally' block runs even if tasks above fail. 
+  # It wipes the storage volume so your disk usage stays low.
+  finally:
+    - name: cleanup-workspace
+      workspaces:
+        - name: source
+          workspace: shared-data
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: wipe-files
+            image: alpine
+            script: |
+              echo "Cleaning up shared storage..."
+              rm -rf \$(workspaces.source.path)/*
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.9.1 Ready."
+echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.9.3 Ready."

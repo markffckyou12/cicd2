@@ -1,98 +1,80 @@
 #!/bin/bash
 set -euo pipefail 
 
-# --- A. THE SAFETY TRAP ---
-# Ensures temporary RBAC is removed even if the script crashes
+# --- A. SAFETY TRAP ---
 cleanup() {
   echo -e "\n\e[33m[CLEANUP]\e[0m Removing temporary security badges..."
-  kubectl delete rolebinding cosign-gen-binding -n tekton-tasks --ignore-not-found
+  kubectl delete rolebinding cosign-gen-binding -n tekton-tasks --ignore-not-found || true
 }
 trap cleanup EXIT
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.9.3 (Native Janitor Edition) ---"
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.2 (Loki Fix Integrated) ---"
 
-# --- 1. IDENTITY & CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 GIT_USER="markffckyou12"
 REPO_NAME="markffckyou12/cicd2"
 DOCKER_USER="ffckyou123"
 NAMESPACE="tekton-tasks"
 IMAGE_NAME="docker.io/$DOCKER_USER/cicd-test:latest"
-TRIVY_SERVER_URL="http://host.minikube.internal:8080"
+TRIVY_SERVER_URL="http://trivy-server.trivy-system.svc.cluster.local:8080"
+LOKI_URL="http://loki-server.trivy-system.svc.cluster.local:3100/loki/api/v1/push"
 COSIGN_PASSWORD="factory-password-123"
 SA_NAME="build-bot"
 
-# --- 2. CREDENTIAL CHECK ---
+# --- 2. CREDENTIALS ---
 if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
 if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
 
-# --- 3. NAMESPACE & KYVERNO INFRA EXCLUSIONS ---
+# --- 3. KYVERNO PERMISSIONS ---
+echo -e "\e[34m[INFO]\e[0m Granting Cleanup Controller permissions for Tekton..."
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:cleanup-tekton
+  labels:
+    app.kubernetes.io/managed-by: Helm
+rules:
+- apiGroups: ["tekton.dev"]
+  resources: ["pipelineruns", "taskruns"]
+  verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kyverno:cleanup-tekton
+subjects:
+- kind: ServiceAccount
+  name: kyverno-cleanup-controller
+  namespace: kyverno
+roleRef:
+  kind: ClusterRole
+  name: kyverno:cleanup-tekton
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# --- 4. INFRASTRUCTURE & RBAC ---
+echo -e "\e[34m[INFO]\e[0m Setting up Namespace and Cosign Keys..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# Patching Kyverno config to ensure it doesn't interfere with internal Tekton/Cosign pods
-kubectl patch configmap kyverno -n kyverno --type merge -p "{\"data\":{\"resourceFilters\":\"[Event,*,*][Node,*,*][APIService,*,*][TokenReview,*,*][SubjectAccessReview,*,*][SelfSubjectAccessReview,*,*][*,kyverno,*][Binding,*,*][ReplicaSet,*,*][AdmissionReport,*,*][ClusterAdmissionReport,*,*][BackgroundScanReport,*,*][ClusterBackgroundScanReport,*,*][*,tekton-tasks,cosign-gen*][*,tekton-tasks,affinity-assistant-*]\"}}"
-
-# --- 4. SECURE KEY GENERATION ---
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" >/dev/null 2>&1; then
-    echo -e "\e[34m[INFO]\e[0m Creating temporary RBAC for key generation..."
     kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE"
-    
     kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never \
       --image=gcr.io/projectsigstore/cosign:v2.2.1 \
       --env="COSIGN_PASSWORD=$COSIGN_PASSWORD" -- generate-key-pair k8s://"$NAMESPACE"/cosign-keys
 fi
-
 PUBLIC_KEY=$(kubectl get secret cosign-keys -n "$NAMESPACE" -o jsonpath='{.data.cosign\.pub}' | base64 -d)
 
-# --- 5. PERMANENT RBAC & AUTH ---
+# Pipeline Secrets & SA
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
-cat <<EOF | kubectl apply -f -
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: cosign-secret-reader
-  namespace: $NAMESPACE
-rules:
-- apiGroups: [""]
-  resources: ["secrets"]
-  resourceNames: ["cosign-keys"]
-  verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: build-bot-read-cosign
-  namespace: $NAMESPACE
-subjects:
-- kind: ServiceAccount
-  name: $SA_NAME
-  namespace: $NAMESPACE
-roleRef:
-  kind: Role
-  name: cosign-secret-reader
-  apiGroup: rbac.authorization.k8s.io
-EOF
-
-# Credentials Setup
 kubectl create secret generic github-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret github-creds "tekton.dev/git-0=https://github.com" --overwrite -n "$NAMESPACE"
 kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-# PVC for Pipeline Workspace
-cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: shared-ci-pvc
-spec:
-  accessModes: [ReadWriteOnce]
-  resources: { requests: { storage: 2Gi } }
-EOF
-
-# --- 6. THE GLOBAL BOUNCER (ClusterPolicy) ---
-echo -e "\e[34m[INFO]\e[0m Deploying Global ClusterPolicy..."
+# --- 5. THE POLICIES ---
+echo -e "\e[34m[INFO]\e[0m Deploying Enforcement and Janitor Policies..."
 cat <<EOF | kubectl apply -f -
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -110,7 +92,7 @@ spec:
       exclude:
         any:
         - resources:
-            namespaces: ["kube-system", "kyverno", "$NAMESPACE", "tekton-pipelines"]
+            namespaces: ["kube-system", "kyverno", "$NAMESPACE", "tekton-pipelines", "trivy-system"]
       verifyImages:
         - imageReferences: ["*"]
           attestors:
@@ -118,9 +100,27 @@ spec:
               - keys:
                   publicKeys: |-
 $(echo "$PUBLIC_KEY" | sed 's/^/                    /')
+---
+apiVersion: kyverno.io/v2
+kind: CleanupPolicy
+metadata:
+  name: cleanup-success-only
+  namespace: $NAMESPACE
+spec:
+  match:
+    any:
+    - resources:
+        kinds: ["tekton.dev/v1/PipelineRun"]
+  schedule: "*/10 * * * *"
+  conditions:
+    all:
+    - key: "{{ target.status.conditions[0].status }}"
+      operator: Equals
+      value: "True"
 EOF
 
-# --- 7. THE PIPELINE (With Integrated Janitor) ---
+# --- 6. THE TEKTON PIPELINE ---
+echo -e "\e[34m[INFO]\e[0m Deploying DevSecOps Pipeline..."
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -134,8 +134,9 @@ spec:
       default: "$IMAGE_NAME"
     - name: trivy-server-url
       default: "$TRIVY_SERVER_URL"
-  workspaces:
-    - name: shared-data
+    - name: loki-url
+      default: "$LOKI_URL"
+  workspaces: [{ name: shared-data }]
   tasks:
     - name: fetch-repo
       taskRef: { resolver: hub, params: [{name: kind, value: task}, {name: name, value: git-clone}, {name: version, value: "0.9"}] }
@@ -151,9 +152,8 @@ spec:
         steps:
           - name: trivy-fs-scan
             image: aquasec/trivy:latest
-            workingDir: \$(workspaces.source.path)
             script: |
-              trivy fs --server \$(params.trivy-server-url) --severity HIGH,CRITICAL .
+              trivy fs --server \$(params.trivy-server-url) --severity HIGH,CRITICAL \$(workspaces.source.path)
     - name: build-and-push
       runAfter: ["source-scan"]
       workspaces: [{ name: source, workspace: shared-data }]
@@ -186,32 +186,50 @@ spec:
                 value: /tekton/creds/.docker/config.json
     - name: security-gate
       runAfter: ["sign-image"]
-      params: [{ name: image-full-name, value: "\$(params.image-full-name)" }]
+      params:
+        - name: image-full-name
+          value: "\$(params.image-full-name)"
+        - name: trivy-server-url
+          value: "\$(params.trivy-server-url)"
+        - name: loki-url
+          value: "\$(params.loki-url)"
       taskSpec:
-        params: [{name: image-full-name, type: string}]
+        params:
+          - name: image-full-name
+            type: string
+          - name: trivy-server-url
+            type: string
+          - name: loki-url
+            type: string
         steps:
-          - name: trivy-image-scan
+          - name: trivy-image-scan-and-audit
             image: aquasec/trivy:latest
             script: |
-              trivy image --server http://host.minikube.internal:8080 --severity CRITICAL --exit-code 1 \$(params.image-full-name)
-  
-  # --- THE NATIVE JANITOR ---
-  # This 'finally' block runs even if tasks above fail. 
-  # It wipes the storage volume so your disk usage stays low.
-  finally:
-    - name: cleanup-workspace
-      workspaces:
-        - name: source
-          workspace: shared-data
-      taskSpec:
-        workspaces:
-          - name: source
-        steps:
-          - name: wipe-files
-            image: alpine
-            script: |
-              echo "Cleaning up shared storage..."
-              rm -rf \$(workspaces.source.path)/*
+              # 1. Run the scan and capture CRITICAL count
+              trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 0 --format json --output report.json \$(params.image-full-name)
+              CRIT_COUNT=\$(grep -c "VulnerabilityID" report.json || echo "0")
+              
+              # 2. Fix Loki Payload: Precise timestamp and clean JSON
+              # Nanoseconds are required by Loki
+              TS_NS="\$(date +%s)000000000"
+              
+              # Construct JSON using a HEREDOC to handle quotes correctly
+              cat <<EOF_JSON > payload.json
+              {
+                "streams": [
+                  {
+                    "stream": { "job": "security-gate", "image": "\$(params.image-full-name)" },
+                    "values": [ [ "\$TS_NS", "Audit: Found \$CRIT_COUNT critical vulnerabilities." ] ]
+                  }
+                ]
+              }
+              EOF_JSON
+
+              echo "Pushing Audit Log to Loki..."
+              wget --header="Content-Type: application/json" --post-file=payload.json -O- \$(params.loki-url) || echo "Loki push failed"
+              
+              # 3. Final Gate: Fail the pipeline if CRITICAL vulnerabilities exist
+              trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.9.3 Ready."
+echo -e "\e[32m[SUCCESS]\e[0m All permissions granted. Factory construction complete."

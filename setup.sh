@@ -1,7 +1,15 @@
 #!/bin/bash
 set -euo pipefail 
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.8.3 ---"
+# --- A. THE SAFETY TRAP ---
+# Ensures temporary RBAC is removed even if the script crashes
+cleanup() {
+  echo -e "\n\e[33m[CLEANUP]\e[0m Removing temporary security badges..."
+  kubectl delete rolebinding cosign-gen-binding -n tekton-tasks --ignore-not-found
+}
+trap cleanup EXIT
+
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v6.9.1 (Global Zero-Trust) ---"
 
 # --- 1. IDENTITY ---
 GIT_USER="markffckyou12"
@@ -16,26 +24,27 @@ SA_NAME="build-bot"
 if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
 if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
 
-# --- 2. CLEANUP & NAMESPACE ---
+# --- 2. NAMESPACE SETUP ---
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# --- 3. KYVERNO GLOBAL EXCLUSIONS ---
-# This allows the "cosign-gen" and Tekton pods to run without being blocked by the signing policy
+# --- 3. KYVERNO INFRA EXCLUSIONS ---
 kubectl patch configmap kyverno -n kyverno --type merge -p "{\"data\":{\"resourceFilters\":\"[Event,*,*][Node,*,*][APIService,*,*][TokenReview,*,*][SubjectAccessReview,*,*][SelfSubjectAccessReview,*,*][*,kyverno,*][Binding,*,*][ReplicaSet,*,*][AdmissionReport,*,*][ClusterAdmissionReport,*,*][BackgroundScanReport,*,*][ClusterBackgroundScanReport,*,*][*,tekton-tasks,cosign-gen*][*,tekton-tasks,affinity-assistant-*]\"}}"
 
-# --- 4. KEY GENERATION ---
+# --- 4. SECURE KEY GENERATION ---
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" >/dev/null 2>&1; then
-    kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-    kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never --image=gcr.io/projectsigstore/cosign:v2.2.1 --env="COSIGN_PASSWORD=$COSIGN_PASSWORD" -- generate-key-pair k8s://"$NAMESPACE"/cosign-keys
-    kubectl delete rolebinding cosign-gen-binding -n "$NAMESPACE"
+    echo -e "\e[34m[INFO]\e[0m Creating temporary RBAC for key generation..."
+    kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE"
+    
+    kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never \
+      --image=gcr.io/projectsigstore/cosign:v2.2.1 \
+      --env="COSIGN_PASSWORD=$COSIGN_PASSWORD" -- generate-key-pair k8s://"$NAMESPACE"/cosign-keys
 fi
 
 PUBLIC_KEY=$(kubectl get secret cosign-keys -n "$NAMESPACE" -o jsonpath='{.data.cosign\.pub}' | base64 -d)
 
-# --- 5. FIXED RBAC & AUTH ---
+# --- 5. PERMANENT RBAC & AUTH ---
 kubectl create serviceaccount "$SA_NAME" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# FIX: Giving the build-bot explicit GET/LIST access to the cosign secret
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -63,24 +72,15 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 EOF
 
-# Credentials
+# Credentials Setup
 kubectl create secret generic github-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret github-creds "tekton.dev/git-0=https://github.com" --overwrite -n "$NAMESPACE"
 kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-# Networking & PVC
+# PVC for Pipeline
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
-apiVersion: v1
-kind: Service
-metadata:
-  name: trivy-service
-spec:
-  type: ExternalName
-  externalName: host.minikube.internal
-  ports: [{port: 8080}]
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -90,7 +90,8 @@ spec:
   resources: { requests: { storage: 2Gi } }
 EOF
 
-# --- 6. ZERO-TRUST POLICY ---
+# --- 6. THE GLOBAL BOUNCER (Updated Policy) ---
+echo -e "\e[34m[INFO]\e[0m Deploying Global ClusterPolicy (Excluding Infra)..."
 cat <<EOF | kubectl apply -f -
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -105,7 +106,10 @@ spec:
         any:
         - resources:
             kinds: ["Pod"]
-            namespaces: ["default"]
+      exclude:
+        any:
+        - resources:
+            namespaces: ["kube-system", "kyverno", "tekton-tasks", "tekton-pipelines"]
       verifyImages:
         - imageReferences: ["*"]
           attestors:
@@ -115,7 +119,7 @@ spec:
 $(echo "$PUBLIC_KEY" | sed 's/^/                    /')
 EOF
 
-# --- 7. RESTORED PIPELINE (WITH SOURCE SCAN) ---
+# --- 7. THE PIPELINE ---
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -136,7 +140,6 @@ spec:
       taskRef: { resolver: hub, params: [{name: kind, value: task}, {name: name, value: git-clone}, {name: version, value: "0.9"}] }
       workspaces: [{ name: output, workspace: shared-data }]
       params: [{ name: url, value: "\$(params.repo-url)" }]
-
     - name: source-scan
       runAfter: ["fetch-repo"]
       workspaces: [{ name: source, workspace: shared-data }]
@@ -150,7 +153,6 @@ spec:
             workingDir: \$(workspaces.source.path)
             script: |
               trivy fs --server \$(params.trivy-server-url) --severity HIGH,CRITICAL .
-
     - name: build-and-push
       runAfter: ["source-scan"]
       workspaces: [{ name: source, workspace: shared-data }]
@@ -166,7 +168,6 @@ spec:
             script: |
               buildah bud --storage-driver=vfs -f ./Dockerfile -t \$(params.image-full-name) .
               buildah push --storage-driver=vfs \$(params.image-full-name)
-
     - name: sign-image
       runAfter: ["build-and-push"]
       params: [{ name: image-full-name, value: "\$(params.image-full-name)" }]
@@ -182,7 +183,6 @@ spec:
                 value: "$COSIGN_PASSWORD"
               - name: REGISTRY_AUTH_FILE
                 value: /tekton/creds/.docker/config.json
-
     - name: security-gate
       runAfter: ["sign-image"]
       params: [{ name: image-full-name, value: "\$(params.image-full-name)" }]
@@ -192,7 +192,7 @@ spec:
           - name: trivy-image-scan
             image: aquasec/trivy:latest
             script: |
-              trivy image --server http://trivy-service.$NAMESPACE.svc.cluster.local:8080 --severity CRITICAL --exit-code 1 \$(params.image-full-name)
+              trivy image --server http://host.minikube.internal:8080 --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.8.3 Ready."
+echo -e "\e[32m[SUCCESS]\e[0m SETUP COMPLETE - V6.9.1 Ready."

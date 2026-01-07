@@ -8,7 +8,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.2 (Loki Fix Integrated) ---"
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.5 (Server-Side Ready) ---"
 
 # --- 1. CONFIGURATION ---
 GIT_USER="markffckyou12"
@@ -21,19 +21,69 @@ LOKI_URL="http://loki-server.trivy-system.svc.cluster.local:3100/loki/api/v1/pus
 COSIGN_PASSWORD="factory-password-123"
 SA_NAME="build-bot"
 
-# --- 2. CREDENTIALS ---
+# --- 2. TOOL & CORE INSTALLATION ---
+if ! command -v tkn &> /dev/null; then
+    echo -e "\e[34m[INFO]\e[0m Installing tkn CLI..."
+    curl -LO https://github.com/tektoncd/cli/releases/download/v0.34.0/tkn_0.34.0_Linux_x86_64.tar.gz
+    sudo tar xvzf tkn_0.34.0_Linux_x86_64.tar.gz -C /usr/local/bin/ tkn > /dev/null
+    rm tkn_0.34.0_Linux_x86_64.tar.gz
+fi
+
+echo -e "\e[34m[INFO]\e[0m Ensuring Tekton & Kyverno are installed..."
+# Standard apply for Tekton
+kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml > /dev/null
+
+# CRITICAL FIX: Server-Side Apply for Kyverno to bypass metadata size limits
+echo -e "\e[34m[INFO]\e[0m Deploying Kyverno (Server-Side Merge)..."
+# Added --force-conflicts to override the previous "kubectl create" ownership
+kubectl apply --server-side --force-conflicts -f https://github.com/kyverno/kyverno/releases/download/v1.13.0/install.yaml > /dev/null
+
+echo -e "\e[34m[INFO]\e[0m Waiting for controllers to be ready..."
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/component=webhook -n tekton-pipelines --timeout=180s
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=kyverno -n kyverno --timeout=180s
+
+# --- 3. CREDENTIALS ---
 if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
 if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
 
-# --- 3. KYVERNO PERMISSIONS ---
-echo -e "\e[34m[INFO]\e[0m Granting Cleanup Controller permissions for Tekton..."
+# --- 4. INFRASTRUCTURE & RBAC ---
+echo -e "\e[34m[INFO]\e[0m Setting up Namespace and Permissions..."
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+# RBAC: Allow build-bot to read cosign-keys
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cosign-secret-reader
+  namespace: $NAMESPACE
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["cosign-keys"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-bot-read-secrets
+  namespace: $NAMESPACE
+subjects:
+- kind: ServiceAccount
+  name: $SA_NAME
+  namespace: $NAMESPACE
+roleRef:
+  kind: Role
+  name: cosign-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# Kyverno Cleanup Permissions
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: kyverno:cleanup-tekton
-  labels:
-    app.kubernetes.io/managed-by: Helm
 rules:
 - apiGroups: ["tekton.dev"]
   resources: ["pipelineruns", "taskruns"]
@@ -53,10 +103,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 EOF
 
-# --- 4. INFRASTRUCTURE & RBAC ---
-echo -e "\e[34m[INFO]\e[0m Setting up Namespace and Cosign Keys..."
-kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
+# Cosign Key Generation
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" >/dev/null 2>&1; then
     kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE"
     kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never \
@@ -72,6 +119,17 @@ kubectl annotate secret github-creds "tekton.dev/git-0=https://github.com" --ove
 kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" --docker-server="https://index.docker.io/v1/" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
+
+# Ensure PVC exists
+cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-ci-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 500Mi } }
+EOF
 
 # --- 5. THE POLICIES ---
 echo -e "\e[34m[INFO]\e[0m Deploying Enforcement and Janitor Policies..."
@@ -205,15 +263,9 @@ spec:
           - name: trivy-image-scan-and-audit
             image: aquasec/trivy:latest
             script: |
-              # 1. Run the scan and capture CRITICAL count
               trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 0 --format json --output report.json \$(params.image-full-name)
               CRIT_COUNT=\$(grep -c "VulnerabilityID" report.json || echo "0")
-              
-              # 2. Fix Loki Payload: Precise timestamp and clean JSON
-              # Nanoseconds are required by Loki
               TS_NS="\$(date +%s)000000000"
-              
-              # Construct JSON using a HEREDOC to handle quotes correctly
               cat <<EOF_JSON > payload.json
               {
                 "streams": [
@@ -224,12 +276,8 @@ spec:
                 ]
               }
               EOF_JSON
-
-              echo "Pushing Audit Log to Loki..."
               wget --header="Content-Type: application/json" --post-file=payload.json -O- \$(params.loki-url) || echo "Loki push failed"
-              
-              # 3. Final Gate: Fail the pipeline if CRITICAL vulnerabilities exist
               trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m All permissions granted. Factory construction complete."
+echo -e "\e[32m[SUCCESS]\e[0m Factory v8.6.5 construction complete."

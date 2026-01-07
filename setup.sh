@@ -8,7 +8,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.5 (Server-Side Ready) ---"
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.9 (Schema Compliance) ---"
 
 # --- 1. CONFIGURATION ---
 GIT_USER="markffckyou12"
@@ -30,12 +30,7 @@ if ! command -v tkn &> /dev/null; then
 fi
 
 echo -e "\e[34m[INFO]\e[0m Ensuring Tekton & Kyverno are installed..."
-# Standard apply for Tekton
 kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml > /dev/null
-
-# CRITICAL FIX: Server-Side Apply for Kyverno to bypass metadata size limits
-echo -e "\e[34m[INFO]\e[0m Deploying Kyverno (Server-Side Merge)..."
-# Added --force-conflicts to override the previous "kubectl create" ownership
 kubectl apply --server-side --force-conflicts -f https://github.com/kyverno/kyverno/releases/download/v1.13.0/install.yaml > /dev/null
 
 echo -e "\e[34m[INFO]\e[0m Waiting for controllers to be ready..."
@@ -50,7 +45,6 @@ if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCK
 echo -e "\e[34m[INFO]\e[0m Setting up Namespace and Permissions..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# RBAC: Allow build-bot to read cosign-keys
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -76,10 +70,7 @@ roleRef:
   kind: Role
   name: cosign-secret-reader
   apiGroup: rbac.authorization.k8s.io
-EOF
-
-# Kyverno Cleanup Permissions
-cat <<EOF | kubectl apply -f -
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -120,7 +111,6 @@ kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKE
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-# Ensure PVC exists
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -280,4 +270,4 @@ spec:
               trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m Factory v8.6.5 construction complete."
+echo -e "\e[32m[SUCCESS]\e[0m Factory v8.6.9 construction complete."

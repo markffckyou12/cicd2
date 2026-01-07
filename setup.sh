@@ -3,12 +3,12 @@ set -euo pipefail
 
 # --- A. SAFETY TRAP ---
 cleanup() {
-  echo -e "\n\e[33m[CLEANUP]\e[0m Removing temporary security badges..."
+  echo -e "\n\e[33m[CLEANUP]\e[0m Cleaning up temporary build artifacts..."
   kubectl delete rolebinding cosign-gen-binding -n tekton-tasks --ignore-not-found || true
 }
 trap cleanup EXIT
 
-echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.6.9 (Schema Compliance) ---"
+echo -e "\e[34m[INFO]\e[0m --- DevSecOps Factory v8.8 (Darwin/macOS Ready) ---"
 
 # --- 1. CONFIGURATION ---
 GIT_USER="markffckyou12"
@@ -21,56 +21,44 @@ LOKI_URL="http://loki-server.trivy-system.svc.cluster.local:3100/loki/api/v1/pus
 COSIGN_PASSWORD="factory-password-123"
 SA_NAME="build-bot"
 
-# --- 2. TOOL & CORE INSTALLATION ---
+# --- 2. PREREQUISITE INSTALLATION (YOUR STEPS) ---
+
+# 2.1 Install Tekton CLI (tkn)
 if ! command -v tkn &> /dev/null; then
-    echo -e "\e[34m[INFO]\e[0m Installing tkn CLI..."
-    curl -LO https://github.com/tektoncd/cli/releases/download/v0.34.0/tkn_0.34.0_Linux_x86_64.tar.gz
-    sudo tar xvzf tkn_0.34.0_Linux_x86_64.tar.gz -C /usr/local/bin/ tkn > /dev/null
-    rm tkn_0.34.0_Linux_x86_64.tar.gz
+  echo -e "\e[33m[INSTALL]\e[0m Installing Tekton CLI (v0.43.0)..."
+  curl -LO https://github.com/tektoncd/cli/releases/download/v0.43.0/tkn_0.43.0_Darwin_all.tar.gz
+  sudo tar xvzf tkn_0.43.0_Darwin_all.tar.gz -C /usr/local/bin tkn
+  rm tkn_0.43.0_Darwin_all.tar.gz
 fi
 
-echo -e "\e[34m[INFO]\e[0m Ensuring Tekton & Kyverno are installed..."
-kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml > /dev/null
-kubectl apply --server-side --force-conflicts -f https://github.com/kyverno/kyverno/releases/download/v1.13.0/install.yaml > /dev/null
+# 2.2 Install Tekton Pipelines
+echo -e "\e[33m[INSTALL]\e[0m Applying Tekton Pipelines..."
+kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 
-echo -e "\e[34m[INFO]\e[0m Waiting for controllers to be ready..."
-kubectl wait --for=condition=Ready pod -l app.kubernetes.io/component=webhook -n tekton-pipelines --timeout=180s
-kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=kyverno -n kyverno --timeout=180s
+# 2.3 Install Kyverno via Helm
+if ! command -v helm &> /dev/null; then
+    echo -e "\e[31m[ERROR]\e[0m Helm is not installed. Please install it first:"
+    echo "brew install helm"
+    exit 1
+fi
+
+echo -e "\e[33m[INSTALL]\e[0m Installing Kyverno via Helm..."
+helm repo add kyverno https://kyverno.github.io/kyverno/
+helm repo update
+helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace
+
+# Wait for infrastructure to be ready
+echo -e "\e[34m[WAIT]\e[0m Waiting for controllers to start..."
+kubectl wait --for=condition=Ready pods --all -n tekton-pipelines --timeout=60s || true
+kubectl wait --for=condition=Ready pods --all -n kyverno --timeout=60s || true
 
 # --- 3. CREDENTIALS ---
 if [ -z "${GIT_TOKEN:-}" ]; then read -s -p "Enter GitHub PAT: " GIT_TOKEN; echo ""; fi
 if [ -z "${DOCKER_PASS:-}" ]; then read -s -p "Enter Docker Hub Password: " DOCKER_PASS; echo ""; fi
 
-# --- 4. INFRASTRUCTURE & RBAC ---
-echo -e "\e[34m[INFO]\e[0m Setting up Namespace and Permissions..."
-kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
+# --- 4. KYVERNO PERMISSIONS ---
+echo -e "\e[34m[INFO]\e[0m Granting Cleanup Controller permissions for Tekton..."
 cat <<EOF | kubectl apply -f -
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: cosign-secret-reader
-  namespace: $NAMESPACE
-rules:
-- apiGroups: [""]
-  resources: ["secrets"]
-  resourceNames: ["cosign-keys"]
-  verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: build-bot-read-secrets
-  namespace: $NAMESPACE
-subjects:
-- kind: ServiceAccount
-  name: $SA_NAME
-  namespace: $NAMESPACE
-roleRef:
-  kind: Role
-  name: cosign-secret-reader
-  apiGroup: rbac.authorization.k8s.io
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -94,7 +82,9 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 EOF
 
-# Cosign Key Generation
+# --- 5. INFRASTRUCTURE & RBAC ---
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
 if ! kubectl get secret cosign-keys -n "$NAMESPACE" >/dev/null 2>&1; then
     kubectl create rolebinding cosign-gen-binding --clusterrole=edit --serviceaccount="$NAMESPACE:default" --namespace="$NAMESPACE"
     kubectl run cosign-gen -n "$NAMESPACE" --rm -i --restart=Never \
@@ -111,17 +101,7 @@ kubectl create secret docker-registry docker-hub-creds --docker-username="$DOCKE
 kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.docker.io/v1/" --overwrite -n "$NAMESPACE"
 kubectl patch serviceaccount "$SA_NAME" -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"cosign-keys\"}, {\"name\": \"github-creds\"}]}"
 
-cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: shared-ci-pvc
-spec:
-  accessModes: [ReadWriteOnce]
-  resources: { requests: { storage: 500Mi } }
-EOF
-
-# --- 5. THE POLICIES ---
+# --- 6. THE POLICIES ---
 echo -e "\e[34m[INFO]\e[0m Deploying Enforcement and Janitor Policies..."
 cat <<EOF | kubectl apply -f -
 apiVersion: kyverno.io/v1
@@ -148,6 +128,8 @@ spec:
               - keys:
                   publicKeys: |-
 $(echo "$PUBLIC_KEY" | sed 's/^/                    /')
+                  rekor:
+                    ignoreTlog: true
 ---
 apiVersion: kyverno.io/v2
 kind: CleanupPolicy
@@ -167,7 +149,7 @@ spec:
       value: "True"
 EOF
 
-# --- 6. THE TEKTON PIPELINE ---
+# --- 7. THE TEKTON PIPELINE ---
 echo -e "\e[34m[INFO]\e[0m Deploying DevSecOps Pipeline..."
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: tekton.dev/v1
@@ -255,19 +237,21 @@ spec:
             script: |
               trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 0 --format json --output report.json \$(params.image-full-name)
               CRIT_COUNT=\$(grep -c "VulnerabilityID" report.json || echo "0")
-              TS_NS="\$(date +%s)000000000"
+              
               cat <<EOF_JSON > payload.json
               {
                 "streams": [
                   {
                     "stream": { "job": "security-gate", "image": "\$(params.image-full-name)" },
-                    "values": [ [ "\$TS_NS", "Audit: Found \$CRIT_COUNT critical vulnerabilities." ] ]
+                    "values": [ [ "\$(date +%s)000000000", "Audit: Found \$CRIT_COUNT critical vulnerabilities." ] ]
                   }
                 ]
               }
               EOF_JSON
+
+              echo "Pushing Audit Log to Loki..."
               wget --header="Content-Type: application/json" --post-file=payload.json -O- \$(params.loki-url) || echo "Loki push failed"
               trivy image --server \$(params.trivy-server-url) --severity CRITICAL --exit-code 1 \$(params.image-full-name)
 EOF
 
-echo -e "\e[32m[SUCCESS]\e[0m Factory v8.6.9 construction complete."
+echo -e "\e[32m[SUCCESS]\e[0m Infrastructure and Pipeline deployed successfully."

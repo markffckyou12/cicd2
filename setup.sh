@@ -17,9 +17,8 @@ REKOR_URL="http://rekor-server.rekor-system.svc.cluster.local"
 FULCIO_URL="http://fulcio-server.fulcio-system.svc.cluster.local"
 
 # ==============================================================================
-# PHASE 2: PRE-FLIGHT (Tekton, Chains & CLI Check)
+# PHASE 2: PRE-FLIGHT (Tekton & CLI Check)
 # ==============================================================================
-# 1. Tekton Pipelines
 if ! kubectl get ns tekton-pipelines >/dev/null 2>&1; then
     echo_info "Installing Tekton Pipelines..."
     kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
@@ -28,27 +27,6 @@ if ! kubectl get ns tekton-pipelines >/dev/null 2>&1; then
     kubectl wait --for condition=established --timeout=120s crd/pipelines.tekton.dev
 fi
 
-# 2. Tekton Chains (Installation & Config)
-if ! kubectl get ns tekton-chains >/dev/null 2>&1; then
-    echo_info "Installing Tekton Chains..."
-    kubectl apply -f https://storage.googleapis.com/tekton-releases/chains/latest/release.yaml
-    kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n tekton-chains --timeout=120s
-    
-    echo_info "Configuring Chains for Keyless Signing..."
-    kubectl patch configmap chains-config -n tekton-chains --type merge -p='{"data":{
-      "artifacts.taskrun.format": "in-toto",
-      "artifacts.taskrun.storage": "oci",
-      "artifacts.oci.storage": "oci",
-      "signers.x509.fulcio.enabled": "true",
-      "signers.x509.fulcio.address": "'$FULCIO_URL'",
-      "signers.x509.rekor.address": "'$REKOR_URL'",
-      "transparency.enabled": "true"
-    }}'
-    kubectl rollout restart deployment tekton-chains-controller -n tekton-chains
-    kubectl wait --for=condition=available deployment/tekton-chains-controller -n tekton-chains --timeout=120s
-fi
-
-# 3. Tekton CLI
 echo_info "Checking for Tekton CLI (tkn)..."
 if ! command -v tkn &> /dev/null; then
     echo_info "Installing tkn CLI..."
@@ -65,6 +43,7 @@ fi
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
+# Infrastructure: Shared Workspace (PVC)
 echo_info "Creating Shared Workspace Storage..."
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
@@ -78,6 +57,7 @@ spec:
       storage: 500Mi
 EOF
 
+# Registry & Git Secrets
 kubectl create secret docker-registry docker-hub-creds \
   --docker-username="$DOCKER_USER" --docker-password="$DOCKER_PASS" \
   --docker-server="https://index.docker.io/v1/" -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -86,6 +66,7 @@ kubectl annotate secret docker-hub-creds "tekton.dev/docker-0=https://index.dock
 kubectl create secret generic github-creds --from-literal=username="$GIT_USER" --from-literal=password="$GIT_TOKEN" --type=kubernetes.io/basic-auth -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl annotate secret github-creds "tekton.dev/git-0=https://github.com" --overwrite -n "$NAMESPACE"
 
+# Service Account Setup
 kubectl create serviceaccount build-bot -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl patch serviceaccount build-bot -n "$NAMESPACE" -p "{\"secrets\": [{\"name\": \"docker-hub-creds\"}, {\"name\": \"github-creds\"}]}"
 
@@ -98,7 +79,7 @@ helm repo update > /dev/null
 helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace --set admissionController.replicas=1 --wait
 
 # ==============================================================================
-# PHASE 5: THE POLICY
+# PHASE 5: THE POLICY (Updated for Enforcement & Mutation)
 # ==============================================================================
 echo_info "Applying Signature Enforcement Policy..."
 cat <<EOF | kubectl apply -f -
@@ -107,8 +88,8 @@ kind: ClusterPolicy
 metadata:
   name: check-image-signature
 spec:
-  validationFailureAction: Audit 
-  background: false
+  validationFailureAction: Enforce
+  background: true
   rules:
     - name: verify-sigstore-signature
       match:
@@ -118,7 +99,8 @@ spec:
             kinds: ["Pod"]
       verifyImages:
       - imageReferences: ["index.docker.io/$DOCKER_USER/*"]
-        mutateDigest: false
+        mutateDigest: true
+        verifyDigest: true
         attestors:
         - entries:
           - keyless:
@@ -190,20 +172,61 @@ spec:
               curl -LO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
               chmod +x cosign-linux-amd64
               mv cosign-linux-amd64 /usr/local/bin/cosign
+              
               curl -s $REKOR_URL/api/v1/log/publicKey > /tmp/rekor.pub
-              curl -s $FULCIO_URL/api/v1/rootCert > /tmp/fulcio_root.pem
               export SIGSTORE_REKOR_PUBLIC_KEY=/tmp/rekor.pub
-              echo "Waiting 30s for Tekton Chains..."
-              sleep 30
-              cosign verify --rekor-url $REKOR_URL --allow-insecure-registry --cert-chain /tmp/fulcio_root.pem --insecure-ignore-sct --certificate-identity="https://kubernetes.io/namespaces/tekton-chains/serviceaccounts/tekton-chains-controller" --certificate-oidc-issuer="https://kubernetes.default.svc.cluster.local" \$(params.image-full-name)
+              
+              cosign initialize
+              echo "Waiting 60s for Tekton Chains to finalize signature..."
+              sleep 60
+              
+              cosign verify \
+                --rekor-url $REKOR_URL \
+                --allow-insecure-registry \
+                --insecure-ignore-sct \
+                --certificate-identity="https://kubernetes.io/namespaces/tekton-chains/serviceaccounts/tekton-chains-controller" \
+                --certificate-oidc-issuer="https://kubernetes.default.svc.cluster.local" \
+                \$(params.image-full-name)
 EOF
+
+# ==============================================================================
+# PHASE 7: AUTO-VERIFICATION TEST LOGIC
+# ==============================================================================
+cat <<'EOF' > verify-deployment.sh
+#!/bin/bash
+NAMESPACE=$1
+IMAGE=$2
+POD_NAME="secure-test-pod"
+
+echo -e "\e[34m[INFO]\e[0m Testing Kyverno Enforcement..."
+kubectl delete pod $POD_NAME -n $NAMESPACE --force --grace-period=0 2>/dev/null
+
+# Attempt to run the newly built image
+if kubectl run $POD_NAME --image=$IMAGE -n $NAMESPACE; then
+    echo -e "\e[32m[SUCCESS]\e[0m Pod creation allowed by Kyverno!"
+    echo "Waiting 15s for Kyverno to stamp the pod..."
+    sleep 15
+    
+    # Check for the pass annotation
+    RESULT=$(kubectl get pod $POD_NAME -n $NAMESPACE -o jsonpath='{.metadata.annotations.kyverno\.io/verify-images}')
+    if [[ "$RESULT" == *"pass"* ]]; then
+        echo -e "\e[32m[SUCCESS]\e[0m Kyverno Annotation: PASS"
+        echo "Proof: $RESULT"
+    else
+        echo -e "\e[33m[WARN]\e[0m Pod created but annotation not found yet. Check logs: kubectl logs -n kyverno -l app.kubernetes.io/name=kyverno"
+    fi
+else
+    echo -e "\e[31m[ERROR]\e[0m Pod was REJECTED. This means signature verification failed."
+fi
+EOF
+chmod +x verify-deployment.sh
 
 echo_success "MASTER BLUEPRINT COMPLETE."
 
 # ==============================================================================
 # TRIGGER SECTION
 # ==============================================================================
-echo_info "To trigger a new build, run the following:"
+echo_info "To trigger the build and auto-verify, run:"
 echo "-----------------------------------------------------------------------"
 echo "tkn pipeline start devsecops-pipeline \\"
 echo "  -n $NAMESPACE \\"
@@ -212,4 +235,7 @@ echo "  --param repo-url=https://github.com/$GIT_USER/cicd2 \\"
 echo "  --param image-full-name=index.docker.io/$DOCKER_USER/demo-app:latest \\"
 echo "  --workspace name=shared-data,claimName=shared-data-pvc \\"
 echo "  --showlog"
+echo ""
+echo "THEN RUN THIS TO TEST THE GATEKEEPER:"
+echo "./verify-deployment.sh $NAMESPACE index.docker.io/$DOCKER_USER/demo-app:latest"
 echo "-----------------------------------------------------------------------"
